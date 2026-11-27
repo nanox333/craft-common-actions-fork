@@ -1,0 +1,57 @@
+name: Shared signing smoke test (throwaway)
+
+# Runs the shared macOS import and Windows signing setup the way release.yml does, on real runners,
+# with made-up test certificates. No real secrets; nothing is published. Delete this branch after.
+# The jobs are a reusable workflow so that, as in release.yml, `$/actions/...` loads the signing
+# helpers from that workflow's own commit; the last job reads the logs to check that it did.
+on:
+  push:
+    branches: [test/shared-signing-smoke-2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke
+    uses: ./.github/workflows/signing-smoke-jobs.yml
+
+  revision:
+    name: The signing helpers came from the workflow's commit
+    needs: smoke
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Check each smoke job's log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs" --paginate \
+            --jq '.jobs[] | select(.name | startswith("smoke / ")) | "\(.id)\t\(.conclusion)\t\(.name)"' > jobs.tsv
+          cat jobs.tsv
+          test "$(wc -l < jobs.tsv)" -eq 3 || { echo "expected three smoke jobs"; exit 1; }
+          while IFS=$'\t' read -r id conclusion name; do
+            test "$conclusion" = success || { echo "$name: $conclusion"; exit 1; }
+            # curl, not gh api: gh refuses to print a response with the log's colour codes in it.
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "$GITHUB_API_URL/repos/$REPO/actions/jobs/$id/logs" | tr -d '\r' > job.log
+            grep -qF "Download action repository '$REPO@$SHA'" job.log || { echo "$name: helpers not downloaded at $SHA"; exit 1; }
+            case "$name" in
+              *Windows*) action=setup-windows-signing ;;
+              *) action=import-macos-certificate ;;
+            esac
+            grep -qF "Run $REPO/actions/$action@$SHA" job.log || { echo "$name: $action did not run from $SHA"; exit 1; }
+            if grep -qE 'Run (storytold/craft-common-actions/actions/[a-z-]+@main|\./actions/)' job.log; then
+              echo "$name: a signing helper ran from @main or the checkout"; exit 1
+            fi
+            echo "OK $name: $action from $REPO@$SHA"
+          done < jobs.tsv
